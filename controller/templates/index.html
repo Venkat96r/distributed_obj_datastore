@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mini Distributed Cloud Object Store</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+    body { font-family: 'Plus Jakarta Sans', sans-serif; }
+    code, pre, .font-mono { font-family: 'JetBrains Mono', monospace; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <!-- Top Navigation -->
+  <nav class="border-b border-slate-800 bg-slate-900/70 backdrop-blur sticky top-0 z-40 px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center space-x-3">
+      <div class="h-9 w-9 rounded-xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center shadow-lg shadow-cyan-500/20">
+        <i class="fa-solid fa-cubes text-white text-lg"></i>
+      </div>
+      <div>
+        <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
+          Mini Cloud Object Store
+          <span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-400 border border-cyan-800">S3 Architecture</span>
+        </h1>
+        <p class="text-xs text-slate-400">Distributed 1MB Chunks &bull; 2x Replication &bull; Self-Healing Controller</p>
+      </div>
+    </div>
+    <div class="flex items-center space-x-4">
+      <div class="flex items-center space-x-2 text-xs text-slate-400">
+        <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
+        <span>Controller Online (Port 8000)</span>
+      </div>
+      <a href="/docs" target="_blank" class="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition flex items-center gap-1.5">
+        <i class="fa-solid fa-book"></i> API Docs (Swagger)
+      </a>
+    </div>
+  </nav>
+
+  <main class="max-w-7xl mx-auto px-6 py-8 space-y-8">
+    <!-- Stat Cards -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-sm">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider mb-2">
+          <span>Active Workers</span>
+          <i class="fa-solid fa-server text-cyan-400 text-base"></i>
+        </div>
+        <div class="flex items-baseline space-x-2">
+          <span id="stat-alive-workers" class="text-3xl font-extrabold text-white">4</span>
+          <span id="stat-total-workers" class="text-sm text-slate-400">/ 4 nodes</span>
+        </div>
+        <p id="stat-workers-status" class="text-xs text-emerald-400 mt-2 font-medium">100% Nodes Healthy</p>
+      </div>
+
+      <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-sm">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider mb-2">
+          <span>Total Objects</span>
+          <i class="fa-solid fa-file-shield text-blue-400 text-base"></i>
+        </div>
+        <div class="flex items-baseline space-x-2">
+          <span id="stat-total-objects" class="text-3xl font-extrabold text-white">0</span>
+          <span class="text-sm text-slate-400">files</span>
+        </div>
+        <p class="text-xs text-slate-400 mt-2">Deduplicated Metadata (SQLite)</p>
+      </div>
+
+      <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-sm">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider mb-2">
+          <span>Stored Chunks</span>
+          <i class="fa-solid fa-layer-group text-purple-400 text-base"></i>
+        </div>
+        <div class="flex items-baseline space-x-2">
+          <span id="stat-total-chunks" class="text-3xl font-extrabold text-white">0</span>
+          <span class="text-sm text-slate-400">1MB chunks</span>
+        </div>
+        <p class="text-xs text-slate-400 mt-2">2x Replicas = <span id="stat-total-replicas">0</span> copies</p>
+      </div>
+
+      <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-sm">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider mb-2">
+          <span>Replication Health</span>
+          <i class="fa-solid fa-heart-pulse text-rose-400 text-base"></i>
+        </div>
+        <div class="flex items-baseline space-x-2">
+          <span id="stat-rep-status" class="text-2xl font-bold text-emerald-400">OPTIMAL</span>
+        </div>
+        <p id="stat-under-replicated" class="text-xs text-slate-400 mt-2">0 under-replicated chunks</p>
+      </div>
+    </div>
+
+    <!-- Storage Workers Grid -->
+    <div>
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h2 class="text-lg font-bold text-white flex items-center gap-2">
+            <i class="fa-solid fa-network-wired text-cyan-400"></i> Distributed Storage Workers
+          </h2>
+          <p class="text-xs text-slate-400">Autonomous storage daemons with persistent Docker volume backends</p>
+        </div>
+        <span class="text-xs text-slate-500 font-mono">Heartbeat Interval: 5s &bull; Timeout: 15s</span>
+      </div>
+
+      <div id="workers-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <!-- Dynamically rendered worker cards -->
+      </div>
+    </div>
+
+    <!-- Object Upload and Object Browser -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <!-- Upload Card -->
+      <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-sm">
+        <h3 class="text-base font-bold text-white mb-2 flex items-center gap-2">
+          <i class="fa-solid fa-cloud-arrow-up text-cyan-400"></i> Upload Object
+        </h3>
+        <p class="text-xs text-slate-400 mb-4">Files > 1MB are automatically sliced into 1MB chunks and replicated to 2 workers.</p>
+
+        <form id="upload-form" class="space-y-4">
+          <div>
+            <label class="block text-xs font-medium text-slate-300 mb-1.5">Select File</label>
+            <input type="file" id="upload-file" required class="w-full text-xs text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-cyan-900/60 file:text-cyan-300 hover:file:bg-cyan-800/60 bg-slate-950/60 border border-slate-800 rounded-lg p-2 focus:outline-none">
+          </div>
+
+          <div>
+            <label class="block text-xs font-medium text-slate-300 mb-1.5">Custom Metadata (Optional JSON)</label>
+            <textarea id="upload-meta" rows="3" placeholder='{"project": "Cloud2026", "author": "Student"}' class="w-full font-mono text-xs bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-slate-200 focus:outline-none focus:border-cyan-500"></textarea>
+          </div>
+
+          <button type="submit" id="upload-btn" class="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 font-semibold text-xs tracking-wide text-white transition flex items-center justify-center gap-2 shadow-lg shadow-cyan-600/20">
+            <i class="fa-solid fa-arrow-up-from-bracket"></i> Slices &amp; Store Object
+          </button>
+        </form>
+        <div id="upload-status" class="mt-3 text-xs hidden"></div>
+      </div>
+
+      <!-- Object Browser Table -->
+      <div class="lg:col-span-2 bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-sm flex flex-col justify-between">
+        <div>
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h3 class="text-base font-bold text-white flex items-center gap-2">
+                <i class="fa-solid fa-folder-tree text-blue-400"></i> Stored Objects
+              </h3>
+              <p class="text-xs text-slate-400">Streamed from chunk replicas on demand with SHA-256 validation</p>
+            </div>
+            <button onclick="refreshData()" class="p-2 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition" title="Refresh">
+              <i class="fa-solid fa-rotate"></i>
+            </button>
+          </div>
+
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead>
+                <tr class="border-b border-slate-800 text-slate-400 font-medium">
+                  <th class="pb-3 pl-1">Object ID</th>
+                  <th class="pb-3">Name</th>
+                  <th class="pb-3">Size</th>
+                  <th class="pb-3">Chunks</th>
+                  <th class="pb-3 text-right pr-1">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="objects-table-body" class="divide-y divide-slate-800/60 font-mono">
+                <!-- Dynamically populated rows -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Visual Chunk Map -->
+    <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-sm">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <i class="fa-solid fa-diagram-project text-purple-400"></i> Chunk Replica Distribution Matrix
+          </h3>
+          <p class="text-xs text-slate-400">Visual mapping of 1MB chunk slices and their dual storage nodes</p>
+        </div>
+        <div class="flex items-center gap-3 text-xs">
+          <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-emerald-500/20 border border-emerald-500"></span> Fully Replicated (2 copies)</span>
+          <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-amber-500/20 border border-amber-500"></span> Under-replicated (1 copy)</span>
+        </div>
+      </div>
+
+      <div id="chunk-matrix-container" class="space-y-4">
+        <p class="text-xs text-slate-500 italic">No objects uploaded yet. Upload a file above to inspect chunk distribution.</p>
+      </div>
+    </div>
+  </main>
+
+  <!-- Metadata Inspector & PATCH Modal -->
+  <div id="meta-modal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center hidden p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full p-6 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <h3 class="text-base font-bold text-white flex items-center gap-2">
+          <i class="fa-solid fa-code text-cyan-400"></i> Object Metadata &amp; Custom Attributes
+        </h3>
+        <button onclick="closeMetaModal()" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+
+      <div class="space-y-3 font-mono text-xs">
+        <div>
+          <span class="text-slate-400">Object ID:</span>
+          <span id="modal-obj-id" class="text-cyan-300 font-bold ml-2"></span>
+        </div>
+        <div class="bg-slate-950 p-3 rounded-xl border border-slate-800/80 max-h-60 overflow-y-auto">
+          <pre id="modal-meta-content" class="text-slate-300"></pre>
+        </div>
+
+        <div class="pt-2">
+          <label class="block text-xs font-sans font-semibold text-slate-300 mb-1">PATCH Custom Metadata (JSON)</label>
+          <textarea id="modal-patch-input" rows="3" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-slate-200 focus:outline-none focus:border-cyan-500"></textarea>
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-3 pt-2">
+        <button onclick="closeMetaModal()" class="px-4 py-2 text-xs font-medium rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300">Close</button>
+        <button onclick="submitPatchMetadata()" class="px-4 py-2 text-xs font-semibold rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white shadow-lg shadow-cyan-600/20">Update Metadata (PATCH)</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentModalObjectId = null;
+
+    async function fetchClusterStatus() {
+      try {
+        const res = await fetch('/internal/status');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // Update stats
+        document.getElementById('stat-alive-workers').innerText = data.alive_workers;
+        document.getElementById('stat-total-workers').innerText = `/ ${data.total_workers} nodes`;
+        document.getElementById('stat-total-objects').innerText = data.total_objects;
+        document.getElementById('stat-total-chunks').innerText = data.total_chunks;
+        document.getElementById('stat-total-replicas').innerText = data.total_chunks * 2;
+
+        const repStatusEl = document.getElementById('stat-rep-status');
+        const underRepEl = document.getElementById('stat-under-replicated');
+        if (data.under_replicated_chunks > 0) {
+          repStatusEl.innerText = `${data.under_replicated_chunks} DEGRADED`;
+          repStatusEl.className = 'text-2xl font-bold text-amber-400';
+          underRepEl.innerText = 'Repair daemon actively re-replicating...';
+        } else {
+          repStatusEl.innerText = 'OPTIMAL';
+          repStatusEl.className = 'text-2xl font-bold text-emerald-400';
+          underRepEl.innerText = 'All chunks maintain 2x redundancy';
+        }
+
+        // Render worker nodes
+        const grid = document.getElementById('workers-grid');
+        grid.innerHTML = '';
+        data.workers.forEach(w => {
+          const isAlive = w.status === 'alive';
+          const card = document.createElement('div');
+          card.className = `p-4 rounded-2xl border transition ${isAlive ? 'bg-slate-900/60 border-slate-800/80' : 'bg-rose-950/20 border-rose-800/60'}`;
+          card.innerHTML = `
+            <div class="flex items-center justify-between mb-3">
+              <span class="font-bold text-sm text-white">${w.worker_id}</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${isAlive ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-rose-950 text-rose-400 border border-rose-800'}">
+                ${w.status.toUpperCase()}
+              </span>
+            </div>
+            <div class="text-xs text-slate-400 space-y-1 font-mono">
+              <div>Port: <span class="text-slate-200">${w.url.split(':').pop()}</span></div>
+              <div>Chunks: <span class="text-cyan-400 font-semibold">${w.chunk_count}</span></div>
+              <div>Heartbeat: <span class="${w.seconds_since_heartbeat > 10 ? 'text-amber-400' : 'text-slate-300'}">${w.seconds_since_heartbeat}s ago</span></div>
+            </div>
+          `;
+          grid.appendChild(card);
+        });
+      } catch (e) {
+        console.error("Status fetch error", e);
+      }
+    }
+
+    async function fetchObjects() {
+      try {
+        const res = await fetch('/api/v1/objects?limit=50');
+        if (!res.ok) return;
+        const data = await res.json();
+        const tbody = document.getElementById('objects-table-body');
+        tbody.innerHTML = '';
+
+        if (!data.objects || data.objects.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" class="py-6 text-center text-slate-500 italic font-sans">No objects stored yet.</td></tr>';
+          document.getElementById('chunk-matrix-container').innerHTML = '<p class="text-xs text-slate-500 italic">No objects uploaded yet.</p>';
+          return;
+        }
+
+        const matrixContainer = document.getElementById('chunk-matrix-container');
+        matrixContainer.innerHTML = '';
+
+        for (const obj of data.objects) {
+          // Add table row
+          const tr = document.createElement('tr');
+          tr.className = 'hover:bg-slate-800/30 transition text-slate-300';
+          const sizeKb = (obj.size / 1024).toFixed(1);
+          tr.innerHTML = `
+            <td class="py-3 pl-1 font-bold text-cyan-400">${obj.object_id}</td>
+            <td class="py-3 font-sans text-white">${obj.name}</td>
+            <td class="py-3">${sizeKb} KB</td>
+            <td class="py-3"><span class="px-2 py-0.5 rounded bg-purple-950/80 text-purple-300 border border-purple-800">${obj.num_chunks}</span></td>
+            <td class="py-3 pr-1 text-right space-x-2">
+              <a href="/api/v1/objects/${obj.object_id}" download="${obj.name}" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs transition" title="Download">
+                <i class="fa-solid fa-download"></i>
+              </a>
+              <button onclick="inspectMetadata('${obj.object_id}')" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-cyan-400 text-xs transition" title="Metadata">
+                <i class="fa-solid fa-info-circle"></i>
+              </button>
+              <button onclick="deleteObject('${obj.object_id}')" class="px-2 py-1 rounded bg-slate-800 hover:bg-rose-900/60 text-rose-400 text-xs transition" title="Delete">
+                <i class="fa-solid fa-trash-can"></i>
+              </button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+
+          // Fetch chunks for matrix display
+          fetchMetaForMatrix(obj.object_id);
+        }
+      } catch (e) {
+        console.error("Objects fetch error", e);
+      }
+    }
+
+    async function fetchMetaForMatrix(objectId) {
+      try {
+        const res = await fetch(`/api/v1/objects/${objectId}/metadata`);
+        if (!res.ok) return;
+        const meta = await res.json();
+
+        const container = document.getElementById('chunk-matrix-container');
+        const card = document.createElement('div');
+        card.className = 'bg-slate-950/60 p-4 rounded-xl border border-slate-800/80';
+        card.innerHTML = `
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-xs font-bold text-white font-mono">${meta.name} <span class="text-slate-500 font-normal">(${meta.object_id})</span></span>
+            <span class="text-[11px] font-mono text-slate-400">${meta.num_chunks} chunks &bull; ${(meta.size / 1024).toFixed(1)} KB</span>
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-2">
+            ${meta.chunks.map(c => `
+              <div class="bg-slate-900 p-2.5 rounded-lg border ${c.workers.length >= 2 ? 'border-emerald-900/60' : 'border-amber-700/80'} text-xs font-mono">
+                <div class="flex justify-between items-center text-slate-400 text-[10px] mb-1">
+                  <span>Chunk #${c.index}</span>
+                  <span>${(c.size / 1024).toFixed(1)} KB</span>
+                </div>
+                <div class="flex flex-wrap gap-1 mt-1.5">
+                  ${c.workers.map(w => `<span class="px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 text-[10px]">${w}</span>`).join('')}
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        `;
+        container.appendChild(card);
+      } catch (e) {}
+    }
+
+    // Upload Handler
+    document.getElementById('upload-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fileInput = document.getElementById('upload-file');
+      const metaInput = document.getElementById('upload-meta');
+      const statusEl = document.getElementById('upload-status');
+      const btn = document.getElementById('upload-btn');
+
+      if (!fileInput.files[0]) return;
+
+      btn.disabled = true;
+      btn.innerText = 'Slicing & Uploading Chunks...';
+      statusEl.className = 'mt-3 text-xs text-cyan-400 block';
+      statusEl.innerText = 'Streaming to workers...';
+
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      if (metaInput.value.trim()) {
+        formData.append('metadata', metaInput.value.trim());
+      }
+
+      try {
+        const res = await fetch('/api/v1/objects', {
+          method: 'POST',
+          body: formData
+        });
+
+        if (res.status === 201) {
+          const data = await res.json();
+          statusEl.className = 'mt-3 text-xs text-emerald-400 block';
+          statusEl.innerText = `Uploaded successfully! Object ID: ${data.object_id} (${data.num_chunks} chunks stored)`;
+          fileInput.value = '';
+          metaInput.value = '';
+          refreshData();
+        } else {
+          const err = await res.json();
+          statusEl.className = 'mt-3 text-xs text-rose-400 block';
+          statusEl.innerText = `Upload failed: ${err.detail || 'Error'}`;
+        }
+      } catch (err) {
+        statusEl.className = 'mt-3 text-xs text-rose-400 block';
+        statusEl.innerText = `Error: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-arrow-up-from-bracket"></i> Slices &amp; Store Object';
+      }
+    });
+
+    async function inspectMetadata(objectId) {
+      currentModalObjectId = objectId;
+      const res = await fetch(`/api/v1/objects/${objectId}/metadata`);
+      if (!res.ok) return;
+      const data = await res.json();
+
+      document.getElementById('modal-obj-id').innerText = data.object_id;
+      document.getElementById('modal-meta-content').innerText = JSON.stringify(data, null, 2);
+      document.getElementById('modal-patch-input').value = JSON.stringify(data.custom_metadata || {}, null, 2);
+      document.getElementById('meta-modal').classList.remove('hidden');
+    }
+
+    function closeMetaModal() {
+      document.getElementById('meta-modal').classList.add('hidden');
+    }
+
+    async function submitPatchMetadata() {
+      if (!currentModalObjectId) return;
+      const raw = document.getElementById('modal-patch-input').value;
+      try {
+        const parsed = JSON.parse(raw);
+        const res = await fetch(`/api/v1/objects/${currentModalObjectId}/metadata`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(parsed)
+        });
+        if (res.ok) {
+          closeMetaModal();
+          refreshData();
+        } else {
+          alert('Failed to update metadata.');
+        }
+      } catch (e) {
+        alert('Invalid JSON metadata format.');
+      }
+    }
+
+    async function deleteObject(objectId) {
+      if (!confirm(`Are you sure you want to delete object ${objectId}?`)) return;
+      const res = await fetch(`/api/v1/objects/${objectId}`, { method: 'DELETE' });
+      if (res.status === 204) {
+        refreshData();
+      } else {
+        alert('Failed to delete object.');
+      }
+    }
+
+    function refreshData() {
+      fetchClusterStatus();
+      fetchObjects();
+    }
+
+    // Initial load and periodic polling
+    refreshData();
+    setInterval(fetchClusterStatus, 2500);
+  </script>
+</body>
+</html>

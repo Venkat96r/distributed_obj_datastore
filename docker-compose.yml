@@ -1,0 +1,121 @@
+version: '3.8'
+
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    container_name: controller
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - DATA_DIR=/data
+      - REPLICATION_FACTOR=2
+      - CHUNK_SIZE=1048576
+      - HEARTBEAT_TIMEOUT=15.0
+      - REPAIR_INTERVAL=5.0
+    volumes:
+      - controller_data:/data
+    networks:
+      - cloud_network
+    restart: unless-stopped
+
+  worker1:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker1
+    ports:
+      - "8001:8001"
+    environment:
+      - WORKER_ID=worker1
+      - PORT=8001
+      - WORKER_PORT=8001
+      - WORKER_URL=http://worker1:8001
+      - CONTROLLER_URL=http://controller:8000
+      - DATA_DIR=/data
+    volumes:
+      - worker1_data:/data
+    networks:
+      - cloud_network
+    depends_on:
+      - controller
+    restart: unless-stopped
+
+  worker2:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker2
+    ports:
+      - "8002:8002"
+    environment:
+      - WORKER_ID=worker2
+      - PORT=8002
+      - WORKER_PORT=8002
+      - WORKER_URL=http://worker2:8002
+      - CONTROLLER_URL=http://controller:8000
+      - DATA_DIR=/data
+    volumes:
+      - worker2_data:/data
+    networks:
+      - cloud_network
+    depends_on:
+      - controller
+    restart: unless-stopped
+
+  worker3:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker3
+    ports:
+      - "8003:8003"
+    environment:
+      - WORKER_ID=worker3
+      - PORT=8003
+      - WORKER_PORT=8003
+      - WORKER_URL=http://worker3:8003
+      - CONTROLLER_URL=http://controller:8000
+      - DATA_DIR=/data
+    volumes:
+      - worker3_data:/data
+    networks:
+      - cloud_network
+    depends_on:
+      - controller
+    restart: unless-stopped
+
+  worker4:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker4
+    ports:
+      - "8004:8004"
+    environment:
+      - WORKER_ID=worker4
+      - PORT=8004
+      - WORKER_PORT=8004
+      - WORKER_URL=http://worker4:8004
+      - CONTROLLER_URL=http://controller:8000
+      - DATA_DIR=/data
+    volumes:
+      - worker4_data:/data
+    networks:
+      - cloud_network
+    depends_on:
+      - controller
+    restart: unless-stopped
+
+volumes:
+  controller_data:
+  worker1_data:
+  worker2_data:
+  worker3_data:
+  worker4_data:
+
+networks:
+  cloud_network:
+    driver: bridge
