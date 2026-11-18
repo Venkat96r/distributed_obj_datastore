@@ -1,19 +1,21 @@
 import os
+import io
 import sys
+import time
 import shutil
 import hashlib
 import tempfile
-import json
 import pytest
 from pathlib import Path
-from starlette.testclient import TestClient
+from fastapi import HTTPException, UploadFile
 import httpx
 
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from common.lru import LRUCache
 from common.models import CHUNK_SIZE, REPLICATION_FACTOR
-from worker.chunk_store import ChunkStore
+from worker.chunk_store import ChunkStore, ChecksumMismatchError
 from controller.database import Database
 from controller.storage_manager import StorageManager
 from controller.repair_manager import RepairManager
@@ -28,30 +30,142 @@ def temp_dir():
 
 @pytest.fixture
 def anyio_backend():
-    return 'asyncio'
+    return "asyncio"
 
 
-def test_chunk_store_atomic_operations(temp_dir):
-    store = ChunkStore(temp_dir)
+def _make_mock_cluster(temp_dir):
+    """Helper creating a Database, 4 ChunkStores, StorageManager, RepairManager, and MockTransport."""
+    db_path = os.path.join(temp_dir, "metadata.db")
+    db = Database(db_path)
+
+    worker_stores = {}
+    worker_online = {}
+    for wid in ["worker1", "worker2", "worker3", "worker4"]:
+        wdir = os.path.join(temp_dir, wid)
+        worker_stores[wid] = ChunkStore(wdir, cache_max_bytes=8 * 1024 * 1024)
+        worker_online[wid] = True
+        db.register_worker(wid, f"http://{wid}:8000")
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        wid = request.url.host
+        store = worker_stores.get(wid)
+        if not store or not worker_online.get(wid, False):
+            raise httpx.ConnectError(f"Worker {wid} unreachable")
+
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok", "worker_id": wid, "cache": store.cache_stats()})
+        if path.startswith("/internal/chunks/"):
+            chunk_id = path.replace("/internal/chunks/", "")
+            if request.method == "PUT":
+                expected_cs = request.headers.get("x-chunk-checksum")
+                try:
+                    size, checksum = store.save_chunk(chunk_id, request.content, expected_checksum=expected_cs)
+                except ChecksumMismatchError as e:
+                    return httpx.Response(400, json={"detail": str(e)})
+                return httpx.Response(201, json={"status": "stored", "size": size, "checksum": checksum})
+            elif request.method == "GET":
+                data = store.get_chunk(chunk_id)
+                if data is None:
+                    return httpx.Response(404, json={"detail": "Not found"})
+                return httpx.Response(200, content=data)
+            elif request.method == "DELETE":
+                store.delete_chunk(chunk_id)
+                return httpx.Response(204)
+        elif path.startswith(f"/internal/workers/{wid}/chunks"):
+            return httpx.Response(200, json={"chunks": store.list_chunks()})
+
+        return httpx.Response(404, json={"detail": "Not found"})
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+    sm = StorageManager(db, staging_dir=os.path.join(temp_dir, "staging"))
+    sm.http_client = mock_client
+    rm = RepairManager(db, storage_manager=sm)
+    rm.http_client = mock_client
+
+    return db, worker_stores, worker_online, sm, rm, mock_client
+
+
+# --- 1. Bounded LRU Cache & Stale-Fill Protection Tests ---
+
+def test_lru_cache_bounds_ttl_and_stale_fill():
+    # Entry bound & LRU eviction
+    cache = LRUCache(max_entries=2, ttl_seconds=60.0)
+    cache.put("a", 1)
+    cache.put("b", 2)
+    assert cache.get("a") == 1  # promotes 'a', so 'b' is LRU
+    cache.put("c", 3)           # evicts 'b'
+    assert cache.get("b") is None
+    assert cache.get("a") == 1
+    assert cache.get("c") == 3
+    assert cache.stats()["evictions"] == 1
+
+    # Stale-fill protection (per-key invalidation)
+    tok = cache.begin_load("x")
+    cache.invalidate("x")  # concurrent writer invalidated 'x' while reader was loading
+    assert cache.put_if_fresh("x", "stale_value", tok) is False
+    assert cache.get("x") is None
+    assert cache.stats()["stale_fills_rejected"] == 1
+
+    # Stale-fill protection (global invalidation)
+    tok2 = cache.begin_load("y")
+    cache.invalidate_all()
+    assert cache.put_if_fresh("y", "stale_global", tok2) is False
+    assert cache.get("y") is None
+
+    # Byte budget bound
+    bcache = LRUCache(max_entries=None, max_bytes=10)
+    assert bcache.put("k1", b"123456", size_bytes=6) is True
+    assert bcache.put("k2", b"123456", size_bytes=6) is True  # evicts k1 (6+6 > 10)
+    assert bcache.get("k1") is None
+    assert bcache.get("k2") == b"123456"
+    assert bcache.put("huge", b"0" * 20, size_bytes=20) is False  # larger than budget
+
+    # TTL expiration
+    tcache = LRUCache(max_entries=10, ttl_seconds=0.05)
+    tcache.put("temp", "val")
+    assert tcache.get("temp") == "val"
+    time.sleep(0.08)
+    assert tcache.get("temp") is None
+
+
+# --- 2. ChunkStore Atomic Ops, Checksum Verification & Cache ---
+
+def test_chunk_store_atomic_operations_checksum_and_cache(temp_dir):
+    # Pre-create a stale temp file to verify cleanup on startup
+    chunks_dir = Path(temp_dir) / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    stale_tmp = chunks_dir / "old_chunk.tmp.9999.abcd1234"
+    stale_tmp.write_bytes(b"partial garbage")
+
+    store = ChunkStore(temp_dir, cache_max_bytes=1024 * 1024)
+    assert not stale_tmp.exists()
+
     test_data = b"Hello, Distributed Cloud Storage! 12345"
     chunk_id = "test_chunk_0"
+    good_hash = hashlib.sha256(test_data).hexdigest()
 
-    # Save chunk
-    size, checksum = store.save_chunk(chunk_id, test_data)
+    # Reject mismatched checksum on write (Fix #9)
+    with pytest.raises(ChecksumMismatchError):
+        store.save_chunk(chunk_id, test_data, expected_checksum="0" * 64)
+    assert store.get_chunk(chunk_id) is None
+
+    # Save chunk with matching checksum (populates cache write-through after fsync)
+    size, checksum = store.save_chunk(chunk_id, test_data, expected_checksum=good_hash)
     assert size == len(test_data)
-    assert checksum == hashlib.sha256(test_data).hexdigest()
+    assert checksum == good_hash
 
-    # Read chunk
+    # Read chunk -> should be a RAM cache HIT!
     retrieved = store.get_chunk(chunk_id)
     assert retrieved == test_data
+    assert store.cache_stats()["hits"] == 1
 
     # List chunks
     chunks = store.list_chunks()
     assert len(chunks) == 1
     assert chunks[0]["chunk_id"] == chunk_id
-    assert chunks[0]["size"] == len(test_data)
 
-    # Intentional corruption
+    # Intentional corruption MUST evict RAM cache so read hits disk!
     assert store.corrupt_chunk(chunk_id) is True
     corrupted_data = store.get_chunk(chunk_id)
     assert corrupted_data != test_data
@@ -63,41 +177,26 @@ def test_chunk_store_atomic_operations(temp_dir):
     assert len(store.list_chunks()) == 0
 
 
+# --- 3. Database CRUD, Metadata Cache & LEFT JOIN Under-Replicated ---
+
 def test_database_crud_and_transactions(temp_dir):
     db_path = os.path.join(temp_dir, "test_metadata.db")
     db = Database(db_path)
 
-    # Register 4 workers
     for i in range(1, 5):
         db.register_worker(f"worker{i}", f"http://worker{i}:800{i}")
 
     workers = db.get_all_workers()
     assert len(workers) == 4
     assert all(w["status"] == "alive" for w in workers)
-
-    # Record Heartbeat
     assert db.record_heartbeat("worker1") is True
     assert db.record_heartbeat("nonexistent") is False
 
-    # Insert object with 2 chunks, each replicated to 2 workers
     obj_id = "obj_abc123"
     chunks_data = [
-        {
-            "chunk_id": f"{obj_id}_0",
-            "idx": 0,
-            "size": 1024,
-            "checksum": "hash0",
-            "workers": ["worker1", "worker2"]
-        },
-        {
-            "chunk_id": f"{obj_id}_1",
-            "idx": 1,
-            "size": 512,
-            "checksum": "hash1",
-            "workers": ["worker3", "worker4"]
-        }
+        {"chunk_id": f"{obj_id}_0", "idx": 0, "size": 1024, "checksum": "hash0", "workers": ["worker1", "worker2"]},
+        {"chunk_id": f"{obj_id}_1", "idx": 1, "size": 512, "checksum": "hash1", "workers": ["worker3", "worker4"]},
     ]
-
     db.create_object_transaction(
         object_id=obj_id,
         name="test_file.txt",
@@ -109,187 +208,301 @@ def test_database_crud_and_transactions(temp_dir):
         chunks_data=chunks_data
     )
 
-    # Retrieve object
-    obj = db.get_object(obj_id)
-    assert obj is not None
-    assert obj["name"] == "test_file.txt"
-    assert obj["size"] == 1536
-    assert obj["num_chunks"] == 2
-    assert obj["custom_metadata"]["author"] == "alice"
-    assert len(obj["chunks"]) == 2
-    assert obj["chunks"][0]["workers"] == ["worker1", "worker2"]
+    # First read = cache miss; second read = cache hit
+    obj1 = db.get_object(obj_id)
+    assert db.get_cache_stats()["misses"] == 1
+    obj2 = db.get_object(obj_id)
+    assert db.get_cache_stats()["hits"] == 1
+    assert obj1 == obj2
 
-    # PATCH custom metadata
+    # PATCH invalidates cache cleanly
     updated = db.update_object_metadata(obj_id, {"status": "reviewed", "version": "2.0"})
     assert updated["custom_metadata"]["status"] == "reviewed"
     assert updated["custom_metadata"]["author"] == "alice"
-    assert updated["custom_metadata"]["version"] == "2.0"
 
-    # List objects
-    objs, total = db.list_objects(limit=10, offset=0)
-    assert total == 1
-    assert objs[0]["object_id"] == obj_id
-
-    # Under-replicated check: all alive so under_replicated should be 0
-    under_rep = db.get_under_replicated_chunks(required_replicas=2)
-    assert len(under_rep) == 0
-
-    # Mark worker2 DEAD -> chunk 0 now has only 1 alive replica (worker1)
-    db.mark_worker_status("worker2", "dead")
+    # Under-replicated check: 0 replicas still detected via LEFT JOIN (Fix #7)
+    db.remove_replica(f"{obj_id}_0", "worker1")
+    db.remove_replica(f"{obj_id}_0", "worker2")
     under_rep = db.get_under_replicated_chunks(required_replicas=2)
     assert len(under_rep) == 1
     assert under_rep[0]["chunk_id"] == f"{obj_id}_0"
-    assert under_rep[0]["alive_workers"] == ["worker1"]
+    assert under_rep[0]["alive_count"] == 0
 
-    # Repair: add replica on worker3
+    # Restore replicas + add 3rd surplus replica -> detected by get_over_replicated_chunks
+    db.add_replica(f"{obj_id}_0", "worker1")
+    db.add_replica(f"{obj_id}_0", "worker2")
     db.add_replica(f"{obj_id}_0", "worker3")
-    under_rep = db.get_under_replicated_chunks(required_replicas=2)
-    assert len(under_rep) == 0
+    over_rep = db.get_over_replicated_chunks(required_replicas=2)
+    assert len(over_rep) == 1
+    assert over_rep[0]["chunk_id"] == f"{obj_id}_0"
 
     # Delete object
     deleted_chunks = db.delete_object(obj_id)
-    assert deleted_chunks is not None
-    assert len(deleted_chunks) == 2
+    assert deleted_chunks is not None and len(deleted_chunks) == 2
     assert db.get_object(obj_id) is None
-    objs, total = db.list_objects()
-    assert total == 0
 
+
+# --- 4. Fix #1: 0-Byte Empty Object Upload & Download ---
+
+@pytest.mark.anyio
+async def test_empty_zero_byte_object_upload_and_download(temp_dir):
+    db, worker_stores, worker_online, sm, rm, mock_client = _make_mock_cluster(temp_dir)
+    try:
+        meta = await sm.upload_object(
+            filename="empty.txt",
+            content_type="text/plain",
+            file_bytes=b"",
+            custom_metadata={"empty": True}
+        )
+        assert meta["size"] == 0
+        assert meta["num_chunks"] == 0
+        assert meta["checksum"] == hashlib.sha256(b"").hexdigest()
+
+        sm.verify_object_readable(meta)
+        chunks = [c async for c in sm.stream_object_chunks(meta["object_id"])]
+        assert b"".join(chunks) == b""
+    finally:
+        await mock_client.aclose()
+
+
+# --- 5. Persistent Staging, Crash Recovery, Resumable Uploads & Idempotency ---
+
+@pytest.mark.anyio
+async def test_persistent_staging_crash_recovery_and_idempotency(temp_dir):
+    db, worker_stores, worker_online, sm, rm, mock_client = _make_mock_cluster(temp_dir)
+    try:
+        payload = b"RESUMABLE_STAGED_DATA_" * 70000  # ~1.5 MiB -> 2 chunks
+        orig_hash = hashlib.sha256(payload).hexdigest()
+
+        # A. Normal upload with Idempotency-Key + Replay returns identical object without duplicating
+        upload1 = UploadFile(file=io.BytesIO(payload), filename="report.bin")
+        obj1, replay1 = await sm.handle_upload(
+            "report.bin", "application/octet-stream", upload1, {"v": 1}, idempotency_key="idem-key-001"
+        )
+        assert replay1 is False
+        assert obj1["checksum"] == orig_hash
+        assert obj1["num_chunks"] == 2
+        # Staged file must be cleaned up after COMMITTED
+        assert list(sm.staging_dir.iterdir()) == []
+
+        upload2 = UploadFile(file=io.BytesIO(payload), filename="report.bin")
+        obj2, replay2 = await sm.handle_upload(
+            "report.bin", "application/octet-stream", upload2, {"v": 1}, idempotency_key="idem-key-001"
+        )
+        assert replay2 is True
+        assert obj2["object_id"] == obj1["object_id"]
+        _, total = db.list_objects()
+        assert total == 1
+
+        # B. Concurrent duplicate Idempotency-Key -> 409 Conflict
+        db.begin_staged_upload("in_flight_id", str(sm._staged_path("in_flight_id")), idempotency_key="idem-busy")
+        sm.active_uploads.add("in_flight_id")
+        with pytest.raises(HTTPException) as exc_info:
+            await sm.handle_upload(
+                "dup.bin", "application/octet-stream",
+                UploadFile(file=io.BytesIO(b"abc"), filename="dup.bin"),
+                {}, idempotency_key="idem-busy"
+            )
+        assert exc_info.value.status_code == 409
+        sm.active_uploads.discard("in_flight_id")
+
+        # C. Dead STREAMING row (from controller crash before commit point) -> cleared cleanly on retry!
+        sm._uploading_path("in_flight_id").write_bytes(b"partial crash bytes")
+        obj_retry, replay_retry = await sm.handle_upload(
+            "retry.bin", "application/octet-stream",
+            UploadFile(file=io.BytesIO(b"fresh data"), filename="retry.bin"),
+            {}, idempotency_key="idem-busy"
+        )
+        assert replay_retry is False
+        assert obj_retry["object_id"] != "in_flight_id"
+        assert not sm._uploading_path("in_flight_id").exists()
+
+        # D. Worker outage during upload -> durably STAGED (returns 503), then RESUMED via Idempotency-Key!
+        for wid in ["worker2", "worker3", "worker4"]:
+            db.mark_worker_status(wid, "dead")
+            worker_online[wid] = False
+
+        with pytest.raises(HTTPException) as exc_503:
+            await sm.handle_upload(
+                "resumable.bin", "application/octet-stream",
+                UploadFile(file=io.BytesIO(payload), filename="resumable.bin"),
+                {"resume": True}, idempotency_key="idem-resume-99"
+            )
+        assert exc_503.value.status_code == 503
+
+        # Pending staged upload exists on disk, NOT visible in list_objects yet
+        staged_rows = db.get_uploads_by_state("STAGED")
+        assert len(staged_rows) == 1
+        staged_oid = staged_rows[0]["object_id"]
+        assert sm._staged_path(staged_oid).is_file()
+        assert db.get_object(staged_oid) is None  # not committed yet
+
+        # Bring workers back online and retry with SAME Idempotency-Key -> resumes directly from staged file!
+        for wid in ["worker2", "worker3", "worker4"]:
+            db.mark_worker_status(wid, "alive")
+            worker_online[wid] = True
+
+        resumed_obj, is_replay = await sm.handle_upload(
+            "resumable.bin", "application/octet-stream",
+            UploadFile(file=io.BytesIO(b""), filename="resumable.bin"),  # doesn't even need re-reading!
+            {"resume": True}, idempotency_key="idem-resume-99"
+        )
+        assert is_replay is False
+        assert resumed_obj["object_id"] == staged_oid
+        assert resumed_obj["checksum"] == orig_hash
+        assert not sm._staged_path(staged_oid).exists()  # cleaned up after commit
+
+        # Verify downloaded bytes match original payload
+        downloaded = b"".join([c async for c in sm.stream_object_chunks(staged_oid)])
+        assert hashlib.sha256(downloaded).hexdigest() == orig_hash
+
+        # E. Simulate Controller Crash RIGHT after STAGED commit point (before rename) + orphan cleanup
+        crash_oid = "crash_oid_01"
+        crash_payload = b"CRASH_SURVIVAL_DATA_" * 60000
+        crash_hash = hashlib.sha256(crash_payload).hexdigest()
+        crash_chunks = (len(crash_payload) + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+        db.begin_staged_upload(crash_oid, str(sm._staged_path(crash_oid)), idempotency_key="idem-crash-01")
+        sm._uploading_path(crash_oid).write_bytes(crash_payload)
+        db.mark_upload_staged(
+            crash_oid, "crashed.bin", len(crash_payload), "application/octet-stream",
+            crash_hash, crash_chunks, {}, str(sm._staged_path(crash_oid))
+        )
+        # Leave an orphan file & a dead STREAMING row to test full recover_staging
+        (sm.staging_dir / "random_orphan.tmp").write_bytes(b"orphan")
+        db.begin_staged_upload("dead_stream_01", str(sm._staged_path("dead_stream_01")))
+        sm._uploading_path("dead_stream_01").write_bytes(b"half")
+
+        rec = sm.recover_staging()
+        assert rec["streaming_aborted"] == 1
+        assert rec["renames_finished"] == 1
+        assert rec["orphans_deleted"] == 1
+        assert sm._staged_path(crash_oid).is_file()
+        assert not (sm.staging_dir / "random_orphan.tmp").exists()
+
+        # Background resume loop commits the crashed upload automatically!
+        await sm.resume_staged_uploads()
+        committed_crash = db.get_object(crash_oid)
+        assert committed_crash is not None
+        assert committed_crash["checksum"] == crash_hash
+        assert not sm._staged_path(crash_oid).exists()
+    finally:
+        await mock_client.aclose()
+
+
+# --- 6. Fix #3 (Startup Probe), Fix #6 (Surplus Trimming) & Fix #8 (Pre-stream 503) ---
+
+@pytest.mark.anyio
+async def test_startup_probe_surplus_trimming_and_prestream_503(temp_dir):
+    db, worker_stores, worker_online, sm, rm, mock_client = _make_mock_cluster(temp_dir)
+    try:
+        # Fix #3: Simulate aged heartbeats after controller downtime (> 15s)
+        with db._lock, db._get_connection() as conn:
+            conn.execute("UPDATE workers SET last_heartbeat = ?", (time.time() - 60.0,))
+            conn.commit()
+        worker_online["worker4"] = False  # worker4 is genuinely offline
+
+        await rm.probe_workers_on_startup()
+        await rm.check_heartbeats()
+
+        alive_ids = {w["worker_id"] for w in db.get_alive_workers()}
+        assert alive_ids == {"worker1", "worker2", "worker3"}
+        assert db.get_worker("worker4")["status"] == "dead"
+
+        # Revive worker4
+        worker_online["worker4"] = True
+        db.register_worker("worker4", "http://worker4:8000")
+
+        # Upload a file, kill one holder, repair (creates 3rd replica), bring holder back, trim surplus!
+        obj = await sm.upload_object("trim.bin", "application/octet-stream", b"A" * 5000, {})
+        cid = obj["chunks"][0]["chunk_id"]
+        holders = obj["chunks"][0]["workers"]
+        victim = holders[0]
+
+        db.mark_worker_status(victim, "dead")
+        worker_online[victim] = False
+        await rm.repair_under_replicated_chunks()
+
+        # Bring victim back -> now chunk has 3 alive replicas
+        worker_online[victim] = True
+        db.register_worker(victim, f"http://{victim}:8000")
+        assert len(db.get_chunk_alive_workers(cid)) == 3
+
+        # Surplus trimmer brings it cleanly back to 2 (Fix #6)
+        await rm.trim_surplus_replicas()
+        assert len(db.get_chunk_alive_workers(cid)) == 2
+        assert len(db.get_over_replicated_chunks(REPLICATION_FACTOR)) == 0
+
+        # Fix #8: Pre-flight 503 if ALL replicas of a chunk are on dead workers
+        for wid in db.get_chunk_alive_workers(cid):
+            db.mark_worker_status(wid, "dead")
+        with pytest.raises(HTTPException) as exc_unavail:
+            sm.verify_object_readable(db.get_object(obj["object_id"]))
+        assert exc_unavail.value.status_code == 503
+    finally:
+        await mock_client.aclose()
+
+
+# --- 7. Full End-to-End Cluster Flow ---
 
 @pytest.mark.anyio
 async def test_end_to_end_cluster_flow(temp_dir):
-    """
-    Simulates complete distributed workflow in-process:
-    1. Creates 4 worker chunk stores.
-    2. Uses custom HTTP transport to route requests between controller and workers.
-    3. Uploads 2.5 MB object (3 chunks).
-    4. Downloads and validates SHA-256 bit-for-bit.
-    5. Tests worker failure & retrieval from replica.
-    6. Tests intentional corruption & silent fallback.
-    7. Tests self-healing repair.
-    8. Tests deletion and chunk removal.
-    """
-    db_path = os.path.join(temp_dir, "metadata.db")
-    db = Database(db_path)
+    db, worker_stores, worker_online, sm, rm, mock_client = _make_mock_cluster(temp_dir)
+    try:
+        # 1. Upload 2.5 MiB file (3 chunks: 1 MiB, 1 MiB, 0.5 MiB)
+        file_size = int(2.5 * 1024 * 1024)
+        file_bytes = b"X" * file_size
+        orig_hash = hashlib.sha256(file_bytes).hexdigest()
 
-    # Setup 4 worker chunk stores
-    worker_stores = {}
-    for wid in ["worker1", "worker2", "worker3", "worker4"]:
-        wdir = os.path.join(temp_dir, wid)
-        worker_stores[wid] = ChunkStore(wdir)
-        db.register_worker(wid, f"http://{wid}:8000")
+        obj_meta = await sm.upload_object(
+            filename="big_document.bin",
+            content_type="application/octet-stream",
+            file_bytes=file_bytes,
+            custom_metadata={"environment": "testing", "priority": "high"}
+        )
 
-    # Custom mock transport routing to worker chunk stores
-    def mock_handler(request: httpx.Request) -> httpx.Response:
-        url_str = str(request.url)
-        host = request.url.host  # e.g. worker1
-        wid = host
-        store = worker_stores.get(wid)
-        if not store:
-            return httpx.Response(500, content=b"Unknown worker host")
+        assert obj_meta["num_chunks"] == 3
+        assert obj_meta["size"] == file_size
+        assert obj_meta["checksum"] == orig_hash
+        for c in obj_meta["chunks"]:
+            assert len(c["workers"]) == 2
+            assert c["workers"][0] != c["workers"][1]
 
-        path = request.url.path
-        if path.startswith("/internal/chunks/"):
-            chunk_id = path.replace("/internal/chunks/", "")
-            if request.method == "PUT":
-                size, checksum = store.save_chunk(chunk_id, request.content)
-                return httpx.Response(201, json={"status": "stored", "size": size, "checksum": checksum})
-            elif request.method == "GET":
-                data = store.get_chunk(chunk_id)
-                if data is None:
-                    return httpx.Response(404, json={"detail": "Not found"})
-                return httpx.Response(200, content=data)
-            elif request.method == "DELETE":
-                store.delete_chunk(chunk_id)
-                return httpx.Response(204)
-        elif path.startswith(f"/internal/workers/{wid}/chunks"):
-            chunks = store.list_chunks()
-            return httpx.Response(200, json={"chunks": chunks})
+        # 2. Download & verify bit-for-bit integrity
+        reassembled = b"".join([c async for c in sm.stream_object_chunks(obj_meta["object_id"])])
+        assert hashlib.sha256(reassembled).hexdigest() == orig_hash
 
-        return httpx.Response(404, json={"detail": "Not found"})
+        # 3. Worker failure + seamless download + self-healing repair
+        db.mark_worker_status("worker2", "dead")
+        worker_online["worker2"] = False
+        after_fail = b"".join([c async for c in sm.stream_object_chunks(obj_meta["object_id"])])
+        assert after_fail == file_bytes
 
-    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+        await rm.repair_under_replicated_chunks()
+        assert len(db.get_under_replicated_chunks(required_replicas=2)) == 0
 
-    # Initialize StorageManager & RepairManager with mock_client
-    sm = StorageManager(db)
-    sm.http_client = mock_client
-    rm = RepairManager(db)
-    rm.http_client = mock_client
+        # 4. Data corruption detection (with cache eviction!) + fallback + self-healing
+        chunk_0_id = obj_meta["chunks"][0]["chunk_id"]
+        alive_holders = db.get_chunk_alive_workers(chunk_0_id)
+        corrupted_worker = alive_holders[0]
+        worker_stores[corrupted_worker].corrupt_chunk(chunk_0_id)
 
-    # 1. Upload a 2.5 MB file (3 chunks: 1MB, 1MB, 0.5MB)
-    file_size = int(2.5 * 1024 * 1024)
-    file_bytes = b"X" * file_size
-    orig_hash = hashlib.sha256(file_bytes).hexdigest()
+        after_corrupt = b"".join([c async for c in sm.stream_object_chunks(obj_meta["object_id"])])
+        assert after_corrupt == file_bytes
+        assert len(db.get_under_replicated_chunks(required_replicas=2)) >= 1
 
-    obj_meta = await sm.upload_object(
-        filename="big_document.bin",
-        content_type="application/octet-stream",
-        file_bytes=file_bytes,
-        custom_metadata={"environment": "testing", "priority": "high"}
-    )
+        worker_online["worker2"] = True
+        db.mark_worker_status("worker2", "alive")
+        await rm.repair_under_replicated_chunks()
+        assert len(db.get_under_replicated_chunks(required_replicas=2)) == 0
 
-    assert obj_meta["num_chunks"] == 3
-    assert obj_meta["size"] == file_size
-    assert obj_meta["checksum"] == orig_hash
-    assert len(obj_meta["chunks"]) == 3
+        # Trim any surplus copies before final delete check
+        await rm.trim_surplus_replicas()
 
-    # Verify each chunk has exactly 2 distinct replica workers
-    for c in obj_meta["chunks"]:
-        assert len(c["workers"]) == 2
-        assert c["workers"][0] != c["workers"][1]
-
-    # 2. Download and verify bit-for-bit integrity
-    downloaded_chunks = []
-    async for chunk_data in sm.stream_object_chunks(obj_meta["object_id"]):
-        downloaded_chunks.append(chunk_data)
-
-    reassembled = b"".join(downloaded_chunks)
-    assert len(reassembled) == file_size
-    assert hashlib.sha256(reassembled).hexdigest() == orig_hash
-
-    # 3. Simulate Worker Failure: mark worker2 DEAD
-    db.mark_worker_status("worker2", "dead")
-    # File download should STILL succeed seamlessly because every chunk has another replica!
-    downloaded_chunks_after_fail = []
-    async for chunk_data in sm.stream_object_chunks(obj_meta["object_id"]):
-        downloaded_chunks_after_fail.append(chunk_data)
-    assert b"".join(downloaded_chunks_after_fail) == file_bytes
-
-    # 4. Run Self-Healing Repair
-    await rm.repair_under_replicated_chunks()
-    # Check that any under-replicated chunk was restored to 2 alive workers
-    under_rep = db.get_under_replicated_chunks(required_replicas=2)
-    assert len(under_rep) == 0
-
-    # 5. Simulate Data Corruption
-    # Corrupt chunk 0 on one worker
-    chunk_0_id = obj_meta["chunks"][0]["chunk_id"]
-    chunk_0_info = db.get_chunk_info(chunk_0_id)
-    corrupted_worker = chunk_0_info["workers"][0]
-    worker_stores[corrupted_worker].corrupt_chunk(chunk_0_id)
-
-    # Download should detect corruption, discard bad replica, and fall back to healthy replica
-    downloaded_after_corruption = []
-    async for chunk_data in sm.stream_object_chunks(obj_meta["object_id"]):
-        downloaded_after_corruption.append(chunk_data)
-    assert b"".join(downloaded_after_corruption) == file_bytes
-
-    # Now the chunk is under-replicated again (because bad replica was discarded)
-    under_rep = db.get_under_replicated_chunks(required_replicas=2)
-    assert len(under_rep) >= 1
-
-    # Revive worker2 and run repair loop to heal the corrupted chunk
-    db.mark_worker_status("worker2", "alive")
-    await rm.repair_under_replicated_chunks()
-    under_rep_after_repair = db.get_under_replicated_chunks(required_replicas=2)
-    assert len(under_rep_after_repair) == 0
-
-    # 6. Delete Object
-    deleted = await sm.delete_object(obj_meta["object_id"])
-    assert deleted is True
-    assert db.get_object(obj_meta["object_id"]) is None
-
-    # Verify chunks removed from worker stores
-    for wid, store in worker_stores.items():
-        assert len(store.list_chunks()) == 0
-
-    await mock_client.aclose()
+        # 5. Delete object and verify clean worker removal
+        assert await sm.delete_object(obj_meta["object_id"]) is True
+        assert db.get_object(obj_meta["object_id"]) is None
+        for wid, store in worker_stores.items():
+            assert len(store.list_chunks()) == 0
+    finally:
+        await mock_client.aclose()

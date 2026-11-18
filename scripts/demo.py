@@ -225,14 +225,18 @@ def test_worker_failure(obj_id: str):
     else:
         print_fail(f"Download failed during worker downtime: status {res.status_code}")
 
-    # 3. Wait for Heartbeat Monitor to detect failure (> 15 seconds)
-    print_sub("Waiting 16 seconds for Controller heartbeat timeout to mark worker2 as DEAD...")
-    for remaining in range(16, 0, -4):
-        print(f"    ... checking in {remaining}s")
-        time.sleep(4)
+    # 3. Wait for Heartbeat Monitor to detect failure (> 15 seconds + up to 5s monitor cycle)
+    print_sub("Waiting for Controller heartbeat timeout to mark worker2 as DEAD (15s timeout)...")
+    worker2_status = None
+    for elapsed in range(0, 24, 2):
+        status_res = requests.get(f"{BASE_URL}/internal/status").json()
+        worker2_status = next((w for w in status_res["workers"] if w["worker_id"] == "worker2"), None)
+        if worker2_status and worker2_status["status"] == "dead":
+            break
+        if elapsed % 4 == 0:
+            print(f"    ... waiting ({elapsed}s elapsed)")
+        time.sleep(2)
 
-    status_res = requests.get(f"{BASE_URL}/internal/status").json()
-    worker2_status = next((w for w in status_res["workers"] if w["worker_id"] == "worker2"), None)
     if worker2_status and worker2_status["status"] == "dead":
         print_success("Controller successfully detected worker2 failure and marked node DEAD!")
     else:
@@ -313,6 +317,109 @@ def test_data_integrity():
         print_fail(f"Download returned error: {dl_res.status_code}")
 
 
+# --- Section 10 Bonus: Persistent Staging, Idempotent Resume & LRU Caching ---
+def test_staging_idempotency_and_cache():
+    print_banner(6, "Persistent Staging, Controller Crash Recovery, Idempotency & LRU Caching")
+
+    # 1. Idempotency-Key deduplication
+    idem_key = f"demo-idem-{int(time.time())}"
+    payload = b"IDEMPOTENCY_AND_STAGING_PAYLOAD_" * 50000  # ~1.5 MiB
+    orig_hash = hashlib.sha256(payload).hexdigest()
+
+    print_sub(f"1. Uploading 1.5 MB object with Idempotency-Key: '{idem_key}' ...")
+    res1 = requests.post(
+        f"{BASE_URL}/api/v1/objects",
+        files={"file": ("idem_test.bin", payload, "application/octet-stream")},
+        headers={"Idempotency-Key": idem_key}
+    )
+    assert res1.status_code == 201, f"Expected 201, got {res1.status_code}: {res1.text}"
+    oid1 = res1.json()["object_id"]
+    print_success(f"First upload committed! Object ID = {oid1}")
+
+    print_sub(f"2. Retrying the exact same upload with Idempotency-Key: '{idem_key}' ...")
+    res2 = requests.post(
+        f"{BASE_URL}/api/v1/objects",
+        files={"file": ("idem_test.bin", payload, "application/octet-stream")},
+        headers={"Idempotency-Key": idem_key}
+    )
+    assert res2.status_code == 201
+    oid2 = res2.json()["object_id"]
+    is_replay = res2.headers.get("X-Idempotent-Replay") == "true"
+    if oid1 == oid2 and is_replay:
+        print_success(f"Idempotent replay verified! Returned same Object ID ({oid2}) with X-Idempotent-Replay: true.")
+    else:
+        print_fail(f"Idempotency check failed: oid1={oid1}, oid2={oid2}, replay={is_replay}")
+
+    # 2. Persistent Staging + Controller Restart Crash Survival + Resume
+    resume_key = f"demo-resume-{int(time.time())}"
+    print_sub("3. Stopping worker2, worker3, worker4 (leaving < 2 alive workers) to test persistent staging...")
+    subprocess.run(["docker", "stop", "worker2", "worker3", "worker4"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print_sub("Waiting 16s for heartbeat timeout so Controller knows < 2 workers are alive...")
+    time.sleep(16)
+
+    print_sub(f"Uploading 1.5 MB file with Idempotency-Key '{resume_key}' during worker outage...")
+    res_staged = requests.post(
+        f"{BASE_URL}/api/v1/objects",
+        files={"file": ("crash_safe.bin", payload, "application/octet-stream")},
+        headers={"Idempotency-Key": resume_key}
+    )
+    if res_staged.status_code == 503:
+        print_success(f"Received expected 503 while workers unavailable: {res_staged.json().get('detail')}")
+    else:
+        print_fail(f"Expected 503, got {res_staged.status_code}")
+
+    pending = requests.get(f"{BASE_URL}/internal/uploads").json()
+    print_sub(f"Staged uploads persisted on Controller disk: {len(pending.get('staged', []))}")
+
+    print_sub("4. Restarting Controller container (`docker restart controller`) to verify crash survival...")
+    subprocess.run(["docker", "restart", "controller"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(4)
+
+    print_sub("5. Starting worker2, worker3, worker4 back up...")
+    subprocess.run(["docker", "start", "worker2", "worker3", "worker4"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(6)
+
+    print_sub(f"6. Retrying with Idempotency-Key '{resume_key}' (or verifying auto-resume after restart)...")
+    res_resumed = requests.post(
+        f"{BASE_URL}/api/v1/objects",
+        files={"file": ("crash_safe.bin", b"", "application/octet-stream")},
+        headers={"Idempotency-Key": resume_key}
+    )
+    if res_resumed.status_code == 201:
+        resumed_oid = res_resumed.json()["object_id"]
+        dl_check = requests.get(f"{BASE_URL}/api/v1/objects/{resumed_oid}")
+        if dl_check.status_code == 200 and hashlib.sha256(dl_check.content).hexdigest() == orig_hash:
+            print_success(f"Crash-safe staged upload resumed & verified bit-for-bit! Object ID = {resumed_oid}")
+        else:
+            print_fail("Resumed object download checksum mismatch!")
+    else:
+        print_fail(f"Resume failed with status {res_resumed.status_code}: {res_resumed.text}")
+
+    # 3. Verify Metadata & Worker LRU Caches
+    print_sub("7. Verifying Controller Metadata LRU Cache & Worker Chunk LRU Cache...")
+    for _ in range(3):
+        requests.get(f"{BASE_URL}/api/v1/objects/{oid1}/metadata")
+        requests.get(f"{BASE_URL}/api/v1/objects/{oid1}")
+
+    status_data = requests.get(f"{BASE_URL}/internal/status").json()
+    mcache = status_data.get("metadata_cache", {})
+    print_success(
+        f"Controller Metadata LRU Cache -> Hits: {mcache.get('hits')}, Misses: {mcache.get('misses')}, "
+        f"Hit Rate: {mcache.get('hit_rate_pct')}%, Entries: {mcache.get('entries')}"
+    )
+    for port in (8001, 8002, 8003, 8004):
+        try:
+            whealth = requests.get(f"http://localhost:{port}/health", timeout=2).json()
+            wc = whealth.get("cache", {})
+            print(
+                f"    - {whealth['worker_id']} Chunk LRU Cache: "
+                f"Hits={wc.get('hits')}, Misses={wc.get('misses')}, "
+                f"Bytes={wc.get('bytes_used', 0) / 1024:.1f} KiB"
+            )
+        except Exception:
+            pass
+
+
 def main():
     print("\n" + "=" * 78)
     print(f"{Style.BOLD} MINI DISTRIBUTED CLOUD OBJECT STORE — PROJECT DEMONSTRATION {Style.RESET}")
@@ -324,6 +431,7 @@ def main():
     test_metadata_management(s1_id)
     test_worker_failure(s2_id)
     test_data_integrity()
+    test_staging_idempotency_and_cache()
 
     print("\n" + "=" * 78)
     print(f"{Style.GREEN} ALL DEMONSTRATION TESTS COMPLETED SUCCESSFULLY! {Style.RESET}")
@@ -332,3 +440,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

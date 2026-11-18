@@ -40,7 +40,7 @@
 
   <main class="max-w-7xl mx-auto px-6 py-8 space-y-8">
     <!-- Stat Cards -->
-    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+    <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
       <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-sm">
         <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider mb-2">
           <span>Active Workers</span>
@@ -62,7 +62,7 @@
           <span id="stat-total-objects" class="text-3xl font-extrabold text-white">0</span>
           <span class="text-sm text-slate-400">files</span>
         </div>
-        <p class="text-xs text-slate-400 mt-2">Deduplicated Metadata (SQLite)</p>
+        <p id="stat-pending-uploads" class="text-xs text-slate-400 mt-2">0 staged/pending uploads</p>
       </div>
 
       <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-sm">
@@ -86,6 +86,18 @@
           <span id="stat-rep-status" class="text-2xl font-bold text-emerald-400">OPTIMAL</span>
         </div>
         <p id="stat-under-replicated" class="text-xs text-slate-400 mt-2">0 under-replicated chunks</p>
+      </div>
+
+      <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-sm">
+        <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider mb-2">
+          <span>Metadata LRU Cache</span>
+          <i class="fa-solid fa-bolt text-amber-400 text-base"></i>
+        </div>
+        <div class="flex items-baseline space-x-2">
+          <span id="stat-cache-hitrate" class="text-3xl font-extrabold text-white">0%</span>
+          <span class="text-sm text-slate-400">hit rate</span>
+        </div>
+        <p id="stat-cache-details" class="text-xs text-slate-400 mt-2">0 hits &bull; 0 misses</p>
       </div>
     </div>
 
@@ -119,6 +131,11 @@
           <div>
             <label class="block text-xs font-medium text-slate-300 mb-1.5">Select File</label>
             <input type="file" id="upload-file" required class="w-full text-xs text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-cyan-900/60 file:text-cyan-300 hover:file:bg-cyan-800/60 bg-slate-950/60 border border-slate-800 rounded-lg p-2 focus:outline-none">
+          </div>
+
+          <div>
+            <label class="block text-xs font-medium text-slate-300 mb-1.5">Idempotency-Key (Optional — Safe Retry / Resume)</label>
+            <input type="text" id="upload-idempotency-key" placeholder="e.g. upload-report-2026-v1" class="w-full font-mono text-xs bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-slate-200 focus:outline-none focus:border-cyan-500">
           </div>
 
           <div>
@@ -236,6 +253,12 @@
         document.getElementById('stat-total-objects').innerText = data.total_objects;
         document.getElementById('stat-total-chunks').innerText = data.total_chunks;
         document.getElementById('stat-total-replicas').innerText = data.total_chunks * 2;
+        document.getElementById('stat-pending-uploads').innerText = `${data.pending_uploads || 0} staged/pending uploads`;
+
+        if (data.metadata_cache) {
+          document.getElementById('stat-cache-hitrate').innerText = `${data.metadata_cache.hit_rate_pct || 0}%`;
+          document.getElementById('stat-cache-details').innerText = `${data.metadata_cache.hits || 0} hits • ${data.metadata_cache.misses || 0} misses (${data.metadata_cache.entries || 0} cached)`;
+        }
 
         const repStatusEl = document.getElementById('stat-rep-status');
         const underRepEl = document.getElementById('stat-under-replicated');
@@ -362,15 +385,16 @@
       e.preventDefault();
       const fileInput = document.getElementById('upload-file');
       const metaInput = document.getElementById('upload-meta');
+      const keyInput = document.getElementById('upload-idempotency-key');
       const statusEl = document.getElementById('upload-status');
       const btn = document.getElementById('upload-btn');
 
       if (!fileInput.files[0]) return;
 
       btn.disabled = true;
-      btn.innerText = 'Slicing & Uploading Chunks...';
+      btn.innerText = 'Staging & Replicating Chunks...';
       statusEl.className = 'mt-3 text-xs text-cyan-400 block';
-      statusEl.innerText = 'Streaming to workers...';
+      statusEl.innerText = 'Streaming to persistent staging & workers...';
 
       const formData = new FormData();
       formData.append('file', fileInput.files[0]);
@@ -378,23 +402,32 @@
         formData.append('metadata', metaInput.value.trim());
       }
 
+      const headers = {};
+      if (keyInput.value.trim()) {
+        headers['Idempotency-Key'] = keyInput.value.trim();
+      }
+
       try {
         const res = await fetch('/api/v1/objects', {
           method: 'POST',
+          headers: headers,
           body: formData
         });
 
         if (res.status === 201) {
           const data = await res.json();
+          const isReplay = res.headers.get('X-Idempotent-Replay') === 'true';
           statusEl.className = 'mt-3 text-xs text-emerald-400 block';
-          statusEl.innerText = `Uploaded successfully! Object ID: ${data.object_id} (${data.num_chunks} chunks stored)`;
+          statusEl.innerText = isReplay
+            ? `Idempotent Replay! Existing Object ID: ${data.object_id} (no duplicate created)`
+            : `Uploaded successfully! Object ID: ${data.object_id} (${data.num_chunks} chunks stored)`;
           fileInput.value = '';
           metaInput.value = '';
           refreshData();
         } else {
           const err = await res.json();
           statusEl.className = 'mt-3 text-xs text-rose-400 block';
-          statusEl.innerText = `Upload failed: ${err.detail || 'Error'}`;
+          statusEl.innerText = `Upload failed (${res.status}): ${err.detail || 'Error'}`;
         }
       } catch (err) {
         statusEl.className = 'mt-3 text-xs text-rose-400 block';
@@ -463,3 +496,4 @@
   </script>
 </body>
 </html>
+

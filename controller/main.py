@@ -12,6 +12,7 @@ from fastapi import (
     File,
     UploadFile,
     Form,
+    Header,
     Request,
     Response,
     HTTPException,
@@ -46,17 +47,22 @@ logger = logging.getLogger("controller")
 PORT = int(os.getenv("PORT", 8000))
 DATA_DIR = os.getenv("DATA_DIR", "./data/controller")
 DB_PATH = os.path.join(DATA_DIR, "metadata.db")
+STAGING_DIR = os.path.join(DATA_DIR, "staging")
 
 db = Database(DB_PATH)
-storage_manager = StorageManager(db)
-repair_manager = RepairManager(db)
+storage_manager = StorageManager(db, staging_dir=STAGING_DIR)
+repair_manager = RepairManager(db, storage_manager=storage_manager)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start background heartbeat checker & self-healing repair loop
+    # 1. Crash recovery of persistent staging directory
+    storage_manager.recover_staging()
+    # 2. Probe known workers so controller restarts don't falsely mark healthy workers DEAD (Fix #3)
+    await repair_manager.probe_workers_on_startup()
+    # 3. Start background heartbeat checker, staged-upload resume loop & self-healing repair loop
     repair_task = asyncio.create_task(repair_manager.start())
-    logger.info("Controller initialized and background repair monitor launched.")
+    logger.info("Controller initialized; staging recovery, startup probe, and repair monitor active.")
     try:
         yield
     finally:
@@ -66,13 +72,14 @@ async def lifespan(app: FastAPI):
             await repair_task
         except asyncio.CancelledError:
             pass
+        await storage_manager.close()
         logger.info("Controller shutdown cleanly.")
 
 
 app = FastAPI(
     title="Mini Distributed Cloud Object Store - Controller",
-    description="S3-compatible distributed object storage controller with automatic chunking and self-healing",
-    version="1.0.0",
+    description="S3-compatible distributed object storage controller with persistent staging, idempotent resumable uploads, LRU caching, and self-healing",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -118,12 +125,14 @@ async def get_dashboard():
 @app.post("/api/v1/objects", status_code=status.HTTP_201_CREATED)
 async def upload_object(
     file: UploadFile = File(...),
-    metadata: Optional[str] = Form(None)
+    metadata: Optional[str] = Form(None),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
 ):
     """
     5.1 Upload Object:
-    Accepts multipart/form-data. Slices file into 1 MB chunks, replicates to 2 alive workers,
-    and commits metadata.
+    Streams multipart/form-data to persistent staging disk (bounded ~1 MiB RAM),
+    supports Idempotency-Key for safe retries and crash-safe resumption,
+    slices into 1 MiB chunks, replicates to 2 alive workers, and commits metadata.
     """
     custom_metadata: Dict[str, Any] = {}
     if metadata:
@@ -139,24 +148,29 @@ async def upload_object(
 
     content_type = file.content_type or "application/octet-stream"
     filename = file.filename or "unnamed_object"
-    file_bytes = await file.read()
+    clean_key = idempotency_key.strip() if idempotency_key and idempotency_key.strip() else None
 
-    result = await storage_manager.upload_object(
+    result, is_replay = await storage_manager.handle_upload(
         filename=filename,
         content_type=content_type,
-        file_bytes=file_bytes,
-        custom_metadata=custom_metadata
+        upload_file=file,
+        custom_metadata=custom_metadata,
+        idempotency_key=clean_key
     )
 
-    return JSONResponse(status_code=status.HTTP_201_CREATED, content=result)
+    headers = {}
+    if is_replay:
+        headers["X-Idempotent-Replay"] = "true"
+
+    return JSONResponse(status_code=status.HTTP_201_CREATED, content=result, headers=headers)
 
 
 @app.get("/api/v1/objects/{object_id}")
 async def download_object(object_id: str):
     """
     5.2 Download Object:
-    Streams the reassembled original object from chunks.
-    Verifies SHA-256 integrity and silently recovers from corrupted copies.
+    Pre-checks replica availability (returns 503 if unreadable) and streams the
+    reassembled original object from chunks with SHA-256 verification and silent failover.
     """
     obj = db.get_object(object_id)
     if not obj:
@@ -164,6 +178,9 @@ async def download_object(object_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Object '{object_id}' not found."
         )
+
+    # Pre-flight readability check before sending 200 headers (Fix #8)
+    storage_manager.verify_object_readable(obj)
 
     headers = {
         "Content-Disposition": f'inline; filename="{obj["name"]}"',
@@ -241,7 +258,7 @@ async def list_objects(
 ):
     """
     5.6 List Objects:
-    Returns stored objects with pagination.
+    Returns committed stored objects with pagination.
     """
     objects, total = db.list_objects(limit=limit, offset=offset)
     return {
@@ -252,7 +269,7 @@ async def list_objects(
     }
 
 
-# --- Internal Worker APIs (Section 6) ---
+# --- Internal Worker & Observability APIs (Section 6) ---
 
 @app.post("/internal/workers/register", status_code=status.HTTP_200_OK)
 async def register_worker(req: WorkerRegisterRequest):
@@ -276,7 +293,6 @@ async def worker_heartbeat(req: WorkerHeartbeatRequest):
     """
     success = db.record_heartbeat(req.worker_id)
     if not success:
-        # Worker is not yet registered
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Worker '{req.worker_id}' not recognized. Please register first."
@@ -284,17 +300,28 @@ async def worker_heartbeat(req: WorkerHeartbeatRequest):
     return {"status": "heartbeat_acknowledged", "worker_id": req.worker_id}
 
 
+@app.get("/internal/uploads")
+async def get_pending_uploads():
+    """
+    Inspect staged / streaming uploads awaiting completion.
+    """
+    return {
+        "streaming": db.get_uploads_by_state("STREAMING"),
+        "staged": db.get_uploads_by_state("STAGED"),
+    }
+
+
 @app.get("/internal/status", response_model=ClusterStatusResponse)
 async def get_cluster_status():
     """
-    Returns full cluster topology, node health, chunk replication status.
+    Returns full cluster topology, node health, chunk replication status,
+    pending staged uploads, and metadata LRU cache metrics.
     """
     workers_raw = db.get_all_workers()
     stats = db.get_cluster_stats()
     under_rep = db.get_under_replicated_chunks(required_replicas=REPLICATION_FACTOR)
 
     alive_count = sum(1 for w in workers_raw if w["status"] == "alive")
-
     workers = [WorkerInfo(**w) for w in workers_raw]
 
     return ClusterStatusResponse(
@@ -305,6 +332,8 @@ async def get_cluster_status():
         alive_workers=alive_count,
         total_workers=len(workers_raw),
         under_replicated_chunks=len(under_rep),
+        pending_uploads=db.get_pending_uploads_count(),
+        metadata_cache=db.get_cache_stats(),
         workers=workers
     )
 

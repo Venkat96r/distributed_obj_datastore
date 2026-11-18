@@ -40,8 +40,10 @@ Designed for cloud computing coursework, production-style demonstrations, and in
 3. **2x Replication Factor**: Every chunk is stored across **two distinct workers**. If any worker node crashes or is killed, no data is lost.
 4. **Active Self-Healing**: Workers send heartbeats every 5 seconds. If a worker goes silent for >15 seconds, the Controller marks it `DEAD`, identifies all under-replicated chunks, and immediately copies them from surviving replicas to other healthy workers to restore the 2x redundancy.
 5. **Data Integrity & Silent Failover**: Every chunk has a SHA-256 fingerprint calculated during upload and verified on read. If corruption occurs (disk bit-rot or tampering), the Controller detects the checksum mismatch, purges the bad replica, silently streams from the healthy secondary replica, and schedules self-healing.
-6. **Constant Memory Streaming**: Downloads and uploads use chunked streaming generators (`StreamingResponse`). Controller memory usage stays around ~1 MB regardless of whether a file is 10 MB or 10 GB.
-7. **Atomic Disk I/O**: Workers write incoming chunks to temporary files (`.tmp.{pid}`) with `fsync`, followed by an atomic `os.replace` rename, preventing partial or torn writes.
+6. **Persistent Staging & Crash-Safe Resumable Uploads**: Uploads stream in 1 MB pieces straight to a persistent staging volume (`/data/staging`), keeping Controller RAM bounded (~1 MB). Once staged and `fsync`ed, a controller crash or temporary worker outage never loses the upload—the startup recovery & background resume loop finishes replicating remaining chunks automatically.
+7. **Idempotency (`Idempotency-Key`)**: Clients can attach an `Idempotency-Key` header to `POST /api/v1/objects`. Retrying a committed key replays the existing object (`X-Idempotent-Replay: true`) without duplicating data, concurrent duplicates return `409 Conflict`, and retrying a staged upload resumes committing directly from disk.
+8. **Bounded LRU Caching**: Both the Controller (metadata manifest LRU with stale-fill protection & automatic invalidation) and Workers (64 MiB chunk LRU, write-through only *after* `fsync`) accelerate hot reads without sacrificing durability.
+9. **Atomic Disk I/O & Write Verification**: Workers verify `X-Chunk-Checksum` before writing to a unique temp file (`.tmp.{pid}.{uuid}`) with `fsync` and atomic `os.replace`, preventing transit corruption and partial writes.
 
 ---
 
@@ -282,3 +284,4 @@ To stop containers and wipe persistent data volumes:
 ```bash
 docker compose down -v
 ```
+

@@ -14,3 +14,4 @@ COPY worker/ /app/worker/
 EXPOSE 8001
 
 CMD ["python", "-m", "worker.main"]
+
