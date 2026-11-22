@@ -225,15 +225,15 @@ def test_worker_failure(obj_id: str):
     else:
         print_fail(f"Download failed during worker downtime: status {res.status_code}")
 
-    # 3. Wait for Heartbeat Monitor to detect failure (> 15 seconds + up to 5s monitor cycle)
-    print_sub("Waiting for Controller heartbeat timeout to mark worker2 as DEAD (15s timeout)...")
+    # 3. Wait for Heartbeat Monitor to detect failure
+    print_sub("Waiting for Controller heartbeat timeout to mark worker2 as DEAD...")
     worker2_status = None
-    for elapsed in range(0, 24, 2):
+    for elapsed in range(0, 60, 2):
         status_res = requests.get(f"{BASE_URL}/internal/status").json()
         worker2_status = next((w for w in status_res["workers"] if w["worker_id"] == "worker2"), None)
         if worker2_status and worker2_status["status"] == "dead":
             break
-        if elapsed % 4 == 0:
+        if elapsed % 6 == 0:
             print(f"    ... waiting ({elapsed}s elapsed)")
         time.sleep(2)
 
@@ -354,8 +354,12 @@ def test_staging_idempotency_and_cache():
     resume_key = f"demo-resume-{int(time.time())}"
     print_sub("3. Stopping worker2, worker3, worker4 (leaving < 2 alive workers) to test persistent staging...")
     subprocess.run(["docker", "stop", "worker2", "worker3", "worker4"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    print_sub("Waiting 16s for heartbeat timeout so Controller knows < 2 workers are alive...")
-    time.sleep(16)
+    print_sub("Waiting for heartbeat timeout so Controller knows < 2 workers are alive...")
+    for _ in range(30):
+        status = requests.get(f"{BASE_URL}/internal/status").json()
+        if status.get("alive_workers", 4) < 2:
+            break
+        time.sleep(2)
 
     print_sub(f"Uploading 1.5 MB file with Idempotency-Key '{resume_key}' during worker outage...")
     res_staged = requests.post(

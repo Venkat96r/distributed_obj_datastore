@@ -86,7 +86,7 @@ services:
       - CONTROLLER_URL=http://controller:8000
       - DATA_DIR=/data
       - WORKER_CACHE_MAX_BYTES=67108864
-      - HEARTBEAT_INTERVAL=15.0
+      - HEARTBEAT_INTERVAL=5.0
     volumes:
       - worker3_data:/data
     networks:

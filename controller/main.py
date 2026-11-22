@@ -300,6 +300,22 @@ async def worker_heartbeat(req: WorkerHeartbeatRequest):
     return {"status": "heartbeat_acknowledged", "worker_id": req.worker_id}
 
 
+@app.get("/internal/workers/{worker_id}/chunks")
+async def get_worker_chunks_endpoint(worker_id: str):
+    """
+    Retrieve information about chunks stored by a worker (Section 6).
+    """
+    worker = db.get_worker(worker_id)
+    if not worker:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Worker '{worker_id}' not found.")
+    chunks = db.get_worker_chunks(worker_id)
+    return {
+        "worker_id": worker_id,
+        "total_chunks": len(chunks),
+        "chunks": chunks
+    }
+
+
 @app.get("/internal/uploads")
 async def get_pending_uploads():
     """

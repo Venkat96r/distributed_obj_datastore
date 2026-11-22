@@ -632,6 +632,17 @@ class Database:
             """, (chunk_id,)).fetchall()
             return [r["worker_id"] for r in rows]
 
+    def get_worker_chunks(self, worker_id: str) -> List[str]:
+        """
+        Retrieve all chunk IDs associated with a specific worker.
+        """
+        with self._lock, self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT chunk_id FROM replicas WHERE worker_id = ? ORDER BY chunk_id ASC",
+                (worker_id,)
+            ).fetchall()
+            return [r["chunk_id"] for r in rows]
+
     def get_under_replicated_chunks(self, required_replicas: int = 2) -> List[Dict[str, Any]]:
         """
         Finds all chunks of COMMITTED objects that have fewer than `required_replicas`
