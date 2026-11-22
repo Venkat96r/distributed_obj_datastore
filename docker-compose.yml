@@ -11,7 +11,7 @@ services:
       - DATA_DIR=/data
       - REPLICATION_FACTOR=2
       - CHUNK_SIZE=1048576
-      - HEARTBEAT_TIMEOUT=15.0
+      - HEARTBEAT_TIMEOUT=45.0
       - REPAIR_INTERVAL=5.0
       - UPLOAD_ABANDON_SECONDS=3600.0
       - UPLOAD_CONCURRENCY=4
@@ -38,6 +38,7 @@ services:
       - CONTROLLER_URL=http://controller:8000
       - DATA_DIR=/data
       - WORKER_CACHE_MAX_BYTES=67108864
+      - HEARTBEAT_INTERVAL=15.0
     volumes:
       - worker1_data:/data
     networks:
@@ -61,6 +62,7 @@ services:
       - CONTROLLER_URL=http://controller:8000
       - DATA_DIR=/data
       - WORKER_CACHE_MAX_BYTES=67108864
+      - HEARTBEAT_INTERVAL=15.0
     volumes:
       - worker2_data:/data
     networks:
@@ -84,6 +86,7 @@ services:
       - CONTROLLER_URL=http://controller:8000
       - DATA_DIR=/data
       - WORKER_CACHE_MAX_BYTES=67108864
+      - HEARTBEAT_INTERVAL=15.0
     volumes:
       - worker3_data:/data
     networks:
@@ -107,6 +110,7 @@ services:
       - CONTROLLER_URL=http://controller:8000
       - DATA_DIR=/data
       - WORKER_CACHE_MAX_BYTES=67108864
+      - HEARTBEAT_INTERVAL=15.0
     volumes:
       - worker4_data:/data
     networks:

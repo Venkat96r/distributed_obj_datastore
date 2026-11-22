@@ -5,8 +5,8 @@ import os
 # System Parameters according to project specification
 CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", 1024 * 1024))  # 1 MiB
 REPLICATION_FACTOR: int = int(os.getenv("REPLICATION_FACTOR", 2))
-HEARTBEAT_INTERVAL: float = float(os.getenv("HEARTBEAT_INTERVAL", 5.0))  # seconds
-HEARTBEAT_TIMEOUT: float = float(os.getenv("HEARTBEAT_TIMEOUT", 15.0))  # seconds
+HEARTBEAT_INTERVAL: float = float(os.getenv("HEARTBEAT_INTERVAL", 15.0))  # seconds
+HEARTBEAT_TIMEOUT: float = float(os.getenv("HEARTBEAT_TIMEOUT", 45.0))  # seconds
 REPAIR_INTERVAL: float = float(os.getenv("REPAIR_INTERVAL", 5.0))  # seconds
 
 # Staging & Resumable Upload Configuration
