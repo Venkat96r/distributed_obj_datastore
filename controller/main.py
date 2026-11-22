@@ -5,7 +5,7 @@ import asyncio
 import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import (
     FastAPI,
@@ -163,6 +163,55 @@ async def upload_object(
         headers["X-Idempotent-Replay"] = "true"
 
     return JSONResponse(status_code=status.HTTP_201_CREATED, content=result, headers=headers)
+
+
+@app.post("/api/v1/objects/batch", status_code=status.HTTP_201_CREATED)
+async def upload_objects_batch(
+    files: List[UploadFile] = File(...),
+    metadata: Optional[str] = Form(None)
+):
+    """
+    Multi-File Batch Upload API:
+    Allows clients to upload multiple arbitrary binary files simultaneously in a single request.
+    Files are processed and distributed concurrently to workers with 2x replication.
+    """
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No files provided for batch upload."
+        )
+
+    custom_metadata: Dict[str, Any] = {}
+    if metadata:
+        try:
+            custom_metadata = json.loads(metadata)
+            if not isinstance(custom_metadata, dict):
+                raise ValueError("Metadata must be a JSON object")
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid JSON metadata: {str(e)}"
+            )
+
+    async def _process_single(f: UploadFile):
+        ctype = f.content_type or "application/octet-stream"
+        fname = f.filename or "unnamed_object"
+        meta_copy = dict(custom_metadata)
+        obj, _ = await storage_manager.handle_upload(
+            filename=fname,
+            content_type=ctype,
+            upload_file=f,
+            custom_metadata=meta_copy
+        )
+        return obj
+
+    # Process all uploaded files concurrently
+    results = await asyncio.gather(*(_process_single(f) for f in files))
+    return {
+        "status": "success",
+        "total_uploaded": len(results),
+        "objects": results
+    }
 
 
 @app.get("/api/v1/objects/{object_id}")

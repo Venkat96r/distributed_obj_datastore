@@ -129,8 +129,8 @@
 
         <form id="upload-form" class="space-y-4">
           <div>
-            <label class="block text-xs font-medium text-slate-300 mb-1.5">Select File</label>
-            <input type="file" id="upload-file" required class="w-full text-xs text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-cyan-900/60 file:text-cyan-300 hover:file:bg-cyan-800/60 bg-slate-950/60 border border-slate-800 rounded-lg p-2 focus:outline-none">
+            <label class="block text-xs font-medium text-slate-300 mb-1.5">Select File(s) <span class="text-slate-400 font-normal">(select one or multiple files)</span></label>
+            <input type="file" id="upload-file" multiple required class="w-full text-xs text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-cyan-900/60 file:text-cyan-300 hover:file:bg-cyan-800/60 bg-slate-950/60 border border-slate-800 rounded-lg p-2 focus:outline-none">
           </div>
 
           <div>
@@ -389,40 +389,61 @@
       const statusEl = document.getElementById('upload-status');
       const btn = document.getElementById('upload-btn');
 
-      if (!fileInput.files[0]) return;
+      if (!fileInput.files || fileInput.files.length === 0) return;
 
+      const numFiles = fileInput.files.length;
       btn.disabled = true;
-      btn.innerText = 'Staging & Replicating Chunks...';
+      btn.innerText = numFiles > 1 ? `Staging & Replicating ${numFiles} Files...` : 'Staging & Replicating Chunks...';
       statusEl.className = 'mt-3 text-xs text-cyan-400 block';
-      statusEl.innerText = 'Streaming to persistent staging & workers...';
-
-      const formData = new FormData();
-      formData.append('file', fileInput.files[0]);
-      if (metaInput.value.trim()) {
-        formData.append('metadata', metaInput.value.trim());
-      }
-
-      const headers = {};
-      if (keyInput.value.trim()) {
-        headers['Idempotency-Key'] = keyInput.value.trim();
-      }
+      statusEl.innerText = numFiles > 1 ? `Processing ${numFiles} files in parallel...` : 'Streaming to persistent staging & workers...';
 
       try {
-        const res = await fetch('/api/v1/objects', {
-          method: 'POST',
-          headers: headers,
-          body: formData
-        });
+        let res;
+        if (numFiles > 1) {
+          // Multi-file batch upload
+          const formData = new FormData();
+          for (let i = 0; i < numFiles; i++) {
+            formData.append('files', fileInput.files[i]);
+          }
+          if (metaInput.value.trim()) {
+            formData.append('metadata', metaInput.value.trim());
+          }
+          res = await fetch('/api/v1/objects/batch', {
+            method: 'POST',
+            body: formData
+          });
+        } else {
+          // Single file upload
+          const formData = new FormData();
+          formData.append('file', fileInput.files[0]);
+          if (metaInput.value.trim()) {
+            formData.append('metadata', metaInput.value.trim());
+          }
+          const headers = {};
+          if (keyInput.value.trim()) {
+            headers['Idempotency-Key'] = keyInput.value.trim();
+          }
+          res = await fetch('/api/v1/objects', {
+            method: 'POST',
+            headers: headers,
+            body: formData
+          });
+        }
 
         if (res.status === 201) {
           const data = await res.json();
-          const isReplay = res.headers.get('X-Idempotent-Replay') === 'true';
           statusEl.className = 'mt-3 text-xs text-emerald-400 block';
-          statusEl.innerText = isReplay
-            ? `Idempotent Replay! Existing Object ID: ${data.object_id} (no duplicate created)`
-            : `Uploaded successfully! Object ID: ${data.object_id} (${data.num_chunks} chunks stored)`;
+          if (numFiles > 1) {
+            statusEl.innerText = `Batch upload complete! Successfully stored ${data.total_uploaded} objects simultaneously.`;
+          } else {
+            const isReplay = res.headers.get('X-Idempotent-Replay') === 'true';
+            statusEl.innerText = isReplay
+              ? `Idempotent Replay! Existing Object ID: ${data.object_id} (no duplicate created)`
+              : `Uploaded successfully! Object ID: ${data.object_id} (${data.num_chunks} chunks stored)`;
+          }
           fileInput.value = '';
           metaInput.value = '';
+          keyInput.value = '';
           refreshData();
         } else {
           const err = await res.json();

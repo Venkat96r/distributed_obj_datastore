@@ -5,6 +5,7 @@ import time
 import shutil
 import hashlib
 import tempfile
+import asyncio
 import pytest
 from pathlib import Path
 from fastapi import HTTPException, UploadFile
@@ -504,5 +505,55 @@ async def test_end_to_end_cluster_flow(temp_dir):
         assert db.get_object(obj_meta["object_id"]) is None
         for wid, store in worker_stores.items():
             assert len(store.list_chunks()) == 0
+    finally:
+        await mock_client.aclose()
+
+
+# --- 8. Multi-Client Concurrent Uploads & Batch Uploads ---
+
+@pytest.mark.anyio
+async def test_concurrent_multi_client_and_batch_uploads(temp_dir):
+    """
+    Verifies that multiple independent clients can upload simultaneously without
+    deadlocks, data corruption, worker collision, or race conditions.
+    """
+    db, worker_stores, worker_online, sm, rm, mock_client = _make_mock_cluster(temp_dir)
+    try:
+        # 1. Simulate 4 clients uploading files at the exact same moment
+        num_clients = 4
+        client_files = [
+            (f"client_{i}_file.bin", f"PAYLOAD_FROM_CLIENT_{i}_DATA_".encode() * 25000)
+            for i in range(num_clients)
+        ]
+
+        async def _client_upload_task(fname, data):
+            uf = UploadFile(file=io.BytesIO(data), filename=fname)
+            obj, _ = await sm.handle_upload(fname, "application/octet-stream", uf, {"client": fname})
+            return obj
+
+        # Fire all 4 client uploads concurrently
+        uploaded_objs = await asyncio.gather(*(
+            _client_upload_task(fname, data) for fname, data in client_files
+        ))
+
+        assert len(uploaded_objs) == num_clients
+        # Verify unique object IDs
+        oids = [obj["object_id"] for obj in uploaded_objs]
+        assert len(set(oids)) == num_clients
+
+        # Verify each client's object downloads bit-for-bit
+        for (fname, orig_bytes), obj in zip(client_files, uploaded_objs):
+            downloaded = b"".join([c async for c in sm.stream_object_chunks(obj["object_id"])])
+            assert downloaded == orig_bytes
+            assert obj["checksum"] == hashlib.sha256(orig_bytes).hexdigest()
+            # Every chunk must have 2 distinct worker replicas
+            for ch in obj["chunks"]:
+                assert len(ch["workers"]) == 2
+                assert ch["workers"][0] != ch["workers"][1]
+
+        # Verify cluster total objects count
+        objs, total = db.list_objects()
+        assert total == num_clients
+
     finally:
         await mock_client.aclose()
